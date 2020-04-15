@@ -1,3 +1,4 @@
+import sys
 from datetime import datetime
 import numpy as np
 import os
@@ -14,25 +15,25 @@ CIGAR_DEFS = {0: "Match", 1: "Insertion", 2: "Deletion",
 
 def get_chimer(chimerpath, minreads, minscore):
     chimerdf = pd.read_csv(chimerpath, sep="\t")
-    print(chimerdf.head())
+    print(chimerdf.head(), file=sys.stderr)
     chimerdf = chimerdf[chimerdf["NumberReads"] > minreads]
     chimerdf = chimerdf[chimerdf["Normalized.Score"] > minscore]
     return chimerdf
 
 
-def get_virus_dict(viralbam, readnames):
-    bam = pysam.AlignmentFile(viralbam, "rb")
-    dict_viral = {}
-    for read in bam:
+def get_read_by_name(viralbam_namesorted, readnames):
+    read_by_name = {}
+    for read in pysam.AlignmentFile(viralbam_namesorted, "rb"):
         if read.qname in readnames or read.qname + ".1" in readnames:
-            if len(read.cigar) > 1 and not read.is_secondary:
+            if len(read.cigar) > 1 and not read.is_secondary and not read.is_supplementary:
                 readname = read.qname + ".1"
                 if read.is_read2:
                     readname = read.qname + ".2"
-                if readname in dict_viral.keys():
-                    print("Error!")
-                dict_viral[readname] = read
-    return dict_viral
+                if readname in read_by_name.keys():  # not caring about supplementary alignment for now
+                    print(f'Error: read {readname} is met twice, '
+                          f'even though secondary and supplementary alignments were ignored')
+                read_by_name[readname] = read
+    return read_by_name
 
 
 def get_virus_info(dict_viral, readname, window):
@@ -73,10 +74,10 @@ def get_virus_info(dict_viral, readname, window):
     return sts[0], ends[0], chromvir, chromlen
 
 
-def get_host_pos(viralbam, hostbam, chromhost, start_host,
+def get_host_pos(viralbam_namesorted, hostbam_indexed, chromhost, start_host,
                  readnames, window=10000):
-    dict_viral = get_virus_dict(viralbam, readnames)
-    bam = pysam.AlignmentFile(hostbam, "rb")
+    viral_read_by_name = get_read_by_name(viralbam_namesorted, readnames)
+    bam = pysam.AlignmentFile(hostbam_indexed, "rb")
     dict_supports = {}
     st_hosts = []
     end_hosts = []
@@ -88,13 +89,13 @@ def get_host_pos(viralbam, hostbam, chromhost, start_host,
     new_read_names = []
     for read in bam.fetch(chromhost, start_host - 2000, start_host + 2000):
         if read.qname in readnames or read.qname + ".1" in readnames:
-            if len(read.cigar) > 1:
+            if len(read.cigar) > 1 and not read.is_secondary:
                 read_positions = read.positions
                 two_cigars = len(read.cigar) == 2
                 # two_cigars = len(read.cigar) >= 2
                 if len(read_positions) < len(read.seq) and two_cigars:
                     virst, virend, virchrom, chromlen = get_virus_info(
-                        dict_viral, read.qname, window)
+                        viral_read_by_name, read.qname, window)
                     if virst != virend:
                         new_read_names.append(read.qname)
                         read_positions = read.get_reference_positions(
@@ -325,17 +326,15 @@ def check_secondary_and_cigar(read1, read2):
         return False
 
 
-def get_read_dict_paired(bam_path, other_bam_path="NA"):
-    print("Working on {}".format(bam_path))
-    sam_link = pysam.AlignmentFile(bam_path, "rb")
-    # order_chroms = []
+def get_read_dict_paired(bam_namesorted_path):
+    print(f"Parsing {bam_namesorted_path}. Assuming it's name-sorted.", file=sys.stderr)
     dict_reads = {}
     read1 = None
     read2 = None
     read1name = ""
     read2name = " "
     reads_no_sequence = []
-    for each_read in sam_link:
+    for each_read in pysam.AlignmentFile(bam_namesorted_path, "rb"):
         if each_read.is_read2:
             read2 = each_read
             read2name = read2.qname
@@ -350,14 +349,12 @@ def get_read_dict_paired(bam_path, other_bam_path="NA"):
                 idx_read = 1
                 for read in [read1, read2]:
                     read_name = "{}.{}".format(read1.qname, idx_read)
-                    dict_reads = parse_read(
-                        read, dict_reads, read_name)
+                    dict_reads = parse_read(read, dict_reads, read_name)
                     idx_read = idx_read + 1
     for each_read, each_dict in dict_reads.items():
         if each_dict.get("Sequence", None) is None:
             reads_no_sequence.append(each_read)
-    sam_link = pysam.AlignmentFile(bam_path, "rb")
-    for each_read in sam_link:
+    for each_read in pysam.AlignmentFile(bam_namesorted_path, "rb"):
         if each_read.qname in reads_no_sequence:
             temp_dict = parse_read(
                 each_read, {}, each_read.qname)
@@ -616,7 +613,7 @@ def summarize_integration(integration_dict, window):
     chroms = get_chrom_dict_integ(integration_dict, window)
     for chrom in chroms.keys():
         print("Working on {} with {} integrations".format(
-            chrom, len(chroms[chrom]["Poses"])))
+            chrom, len(chroms[chrom]["Poses"])), file=sys.stderr)
         for each_pos in chroms[chrom]["Poses"]:
             range_pos = range(each_pos - window, each_pos + window)
             for each_read, each_dict in integration_dict.items():
@@ -650,22 +647,18 @@ def summarize_integration(integration_dict, window):
     return summary_dict
 
 
-def find_integration(host_bam, viral_bam, paired_end):
-    WINDOW = 25
-    print("Started working on {} and {}".format(host_bam, viral_bam))
+def find_integration(host_bam_namesorted, viral_bam_namesorted, paired_end, window=25):
+    print(f"Finding approximate integrations in host BAM {host_bam_namesorted} "
+          f"and viral BAM {viral_bam_namesorted}", file=sys.stderr)
     if paired_end:
-        dict_reads_virus = get_read_dict_paired(viral_bam, host_bam)
-        dict_reads_host = get_read_dict_paired(host_bam, viral_bam)
-        integration_dict = annotate_regions_paired(
-            dict_reads_virus, dict_reads_host)
+        dict_reads_virus = get_read_dict_paired(viral_bam_namesorted)
+        dict_reads_host = get_read_dict_paired(host_bam_namesorted)
+        integration_dict = annotate_regions_paired(dict_reads_virus, dict_reads_host)
     else:
-        dict_reads_virus = get_read_dict(viral_bam)
-        dict_reads_host = get_read_dict(host_bam)
-        integration_dict = annotate_regions(
-            dict_reads_virus, dict_reads_host)
-    print(integration_dict)
-    out_dict = summarize_integration(
-        integration_dict, WINDOW)
+        dict_reads_virus = get_read_dict(viral_bam_namesorted)
+        dict_reads_host = get_read_dict(host_bam_namesorted)
+        integration_dict = annotate_regions(dict_reads_virus, dict_reads_host)
+    out_dict = summarize_integration(integration_dict, window)
     out_list = []
     for each_integration, each_dict in out_dict.items():
         if int(each_dict["Supporting reads"]) > 1:
@@ -676,13 +669,13 @@ def find_integration(host_bam, viral_bam, paired_end):
             try:
                 supp_reads = supp_reads[0]
             except Exception:
-                None
+                pass
             try:
                 score_reads = score_reads[0]
             except Exception:
-                None
+                pass
             ad_list = [
-                host_bam, viral_bam, each_dict["Chrom.Host"],
+                host_bam_namesorted, viral_bam_namesorted, each_dict["Chrom.Host"],
                 each_dict["Start.Host"], each_dict["Strand.Host"],
                 each_dict["Chrom.Virus"], each_dict["Start.Virus"],
                 each_dict["Strand.Virus"],
@@ -729,30 +722,30 @@ class polyidusEngine:
     def align_files(self):
         print(
             "Aligning to viral genome at: {}".format(
-                str(datetime.now())))
+                str(datetime.now())), file=sys.stderr)
         if self.aligner == "bwa":
             self.align_virus_bwa()
         else:
             self.align_virus()
         print(
             "Extracting mapped fastqs from the viral genome at: {}".format(
-                str(datetime.now())))
+                str(datetime.now())), file=sys.stderr)
         self.extract_virus()
         print(
             "Aligning viral-mapped FASTQs to host at: {}".format(
-                str(datetime.now())))
+                str(datetime.now())), file=sys.stderr)
         if self.aligner == "bwa":
             self.align_host_bwa()
         else:
             self.align_host()
         print(
             "All BAM files generated successfully at: {}".format(
-                str(datetime.now())))
+                str(datetime.now())), file=sys.stderr)
 
     def align_virus(self):
         self.viralbam_temp = os.path.join(
             self.outdir_viral, "virusAligned-temp.bam")
-        self.viralbam_final = os.path.join(
+        self.viralbam_namesorted = os.path.join(
             self.outdir_viral, "virusAligned-final.bam")
         if len(self.fastq) == 1:
             job1 = [
@@ -761,7 +754,7 @@ class polyidusEngine:
             job2 = [
                 "samtools",
                 "view", "-bS", "-F", "4", "-o",
-                self.viralbam_final,
+                self.viralbam_namesorted,
                 "-"]
         elif len(self.fastq) == 2:
             job1 = [
@@ -802,7 +795,7 @@ class polyidusEngine:
                 subprocess.run(eachjob, check=True)
             job6 = ["samtools", "merge", "-", viralbam_temp1,
                     viralbam_temp2, viralbam_bothmapped]
-            job7 = ["samtools", "sort", "-n", "-", "-o", self.viralbam_final]
+            job7 = ["samtools", "sort", "-n", "-", "-o", self.viralbam_namesorted]
             self.command_lists.append(job6 + ["|"] + job7)
             self.update_log()
             p3 = subprocess.Popen(job6, stdout=subprocess.PIPE)
@@ -814,7 +807,7 @@ class polyidusEngine:
         self.fastq_path_1 = os.path.join(
             self.outdir_viral, "ViralAligned_1.fastq")
         job1 = ["bedtools", "bamtofastq", "-i",
-                self.viralbam_final, "-fq", self.fastq_path_1]
+                self.viralbam_namesorted, "-fq", self.fastq_path_1]
         if len(self.fastq) == 2:
             self.fastq_path_2 = os.path.join(
                 self.outdir_viral, "ViralAligned_2.fastq")
@@ -849,10 +842,10 @@ class polyidusEngine:
         p2 = subprocess.Popen(job2, stdin=p1.stdout, stdout=subprocess.PIPE)
         p2.communicate()
         # Sort host output
-        self.hostbam_sorted = os.path.join(
+        self.hostbam_indexed = os.path.join(
             self.outdir_host, "hostAligned_sorted.bam")
-        job3 = ["samtools", "sort", self.hostbam, "-o", self.hostbam_sorted]
-        job4 = ["samtools", "index", self.hostbam_sorted]
+        job3 = ["samtools", "sort", self.hostbam, "-o", self.hostbam_indexed]
+        job4 = ["samtools", "index", self.hostbam_indexed]
         for eachjob in [job3, job4]:
             self.command_lists.append(eachjob)
             self.update_log()
@@ -861,7 +854,7 @@ class polyidusEngine:
     def align_virus_bwa(self):
         self.viralbam_temp = os.path.join(
             self.outdir_viral, "virusAligned-temp.bam")
-        self.viralbam_final = os.path.join(
+        self.viralbam_namesorted = os.path.join(
             self.outdir_viral, "virusAligned-final.bam")
         if len(self.fastq) == 1:
             job1 = [
@@ -871,7 +864,7 @@ class polyidusEngine:
             job2 = [
                 "samtools",
                 "view", "-bS", "-F", "4", "-o",
-                self.viralbam_final,
+                self.viralbam_namesorted,
                 "-"]
         elif len(self.fastq) == 2:
             job1 = [
@@ -898,7 +891,7 @@ class polyidusEngine:
                 "4", "-F", "264", self.viralbam_temp,
                 "-o", viralbam_temp1]
             job4 = [
-                "samtools" "view", "-bS", "-f", "8", "-F", "260",
+                "samtools", "view", "-bS", "-f", "8", "-F", "260",
                 self.viralbam_temp, "-o", viralbam_temp2]
             job5 = [
                 "samtools", "view", "-bS", "-f", "1", "-F", "12",
@@ -909,7 +902,7 @@ class polyidusEngine:
                 subprocess.run(eachjob, check=True)
             job6 = ["samtools", "merge", "-", viralbam_temp1,
                     viralbam_temp2, viralbam_bothmapped]
-            job7 = ["samtools", "sort", "-n", "-", "-o", self.viralbam_final]
+            job7 = ["samtools", "sort", "-n", "-", "-o", self.viralbam_namesorted]
             self.command_lists.append(job6 + ["|"] + job7)
             self.update_log()
             p3 = subprocess.Popen(job6, stdout=subprocess.PIPE)
@@ -944,10 +937,10 @@ class polyidusEngine:
         p2 = subprocess.Popen(job2, stdin=p1.stdout, stdout=subprocess.PIPE)
         p2.communicate()
         # Sort host output
-        self.hostbam_sorted = os.path.join(
+        self.hostbam_indexed = os.path.join(
             self.outdir_host, "hostAligned_sorted.bam")
-        job3 = ["samtools", "sort", self.hostbam, "-o", self.hostbam_sorted]
-        job4 = ["samtools", "index", self.hostbam_sorted]
+        job3 = ["samtools", "sort", self.hostbam, "-o", self.hostbam_indexed]
+        job4 = ["samtools", "index", self.hostbam_indexed]
         for eachjob in [job3, job4]:
             self.command_lists.append(eachjob)
             self.update_log()
@@ -962,12 +955,12 @@ class polyidusEngine:
                       "NumberReads", "Score",
                       "Normalized.Score", "ReadNames"]]
         ad_list = find_integration(
-            self.hostbam, self.viralbam_final, self.paired)
+            self.hostbam, self.viralbam_namesorted, self.paired)
         integlist.extend(ad_list)
         with open(self.integpath_approximate, "w") as out_link:
             for each_list in integlist:
                 out_str = "\t".join(each_list) + "\n"
-                print(out_str)
+                print(out_str, file=sys.stderr)
                 out_link.write(out_str)
 
     def find_exact_integrations(self):
@@ -975,7 +968,7 @@ class polyidusEngine:
         minreads = 2
         minscore = 0.6
         # Get sample name
-        path = os.path.normpath(self.viralbam_final)
+        path = os.path.normpath(self.viralbam_namesorted)
         pathparts = path.split(os.sep)
         samplename = pathparts[-3]
         # Make output path
@@ -1000,7 +993,7 @@ class polyidusEngine:
                         [int(each) for each in
                          chimerdf.iloc[i, 3].split(", ")]))
                 dictposes = get_host_pos(
-                    self.viralbam_final, self.hostbam_sorted, chromhost,
+                    self.viralbam_namesorted, self.hostbam_indexed, chromhost,
                     start_host, readnames)
                 LEN_VIR = len(dictposes["ChromVirus"]) > 0
                 if LEN_VIR and dictposes["ChromVirus"][0] != "NA":
@@ -1009,6 +1002,6 @@ class polyidusEngine:
                         for key in keys:
                             adlist.append(str(dictposes[key][j]))
                         adlist.append(samplename)
-                        print("\t".join(adlist))
+                        print("\t".join(adlist), file=sys.stderr)
                         outlink.write("\t".join(adlist) + "\n")
         outlink.close()
